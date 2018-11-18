@@ -24,14 +24,26 @@ import (
 	"sync"
 
 	"github.com/gorilla/mux"
+	"github.com/jaegertracing/jaeger/cmd/agent/app/processors"
+	"github.com/jaegertracing/jaeger/cmd/agent/app/reporter"
 	"github.com/jaegertracing/jaeger/cmd/collector/app"
 	"github.com/jaegertracing/jaeger/thrift-gen/jaeger"
+	"github.com/jaegertracing/jaeger/thrift-gen/zipkincore"
 	tchannel "github.com/uber/tchannel-go"
 	"github.com/uber/tchannel-go/thrift"
 
 	"github.com/census-instrumentation/opencensus-service/receiver"
 	"github.com/census-instrumentation/opencensus-service/translator/trace"
 )
+
+type Configuration struct {
+	TChannelPort      int `json:"tchannel_port",yaml:"tchannel_port"`
+	CollectorHTTPPort int `json:"collector_http_port",yaml:"collector_http_port"`
+
+	ZipkinThriftUDPPort        int `yaml:"zipkin_thrift_udp_port"`
+	JaegerCompactThriftUDPPort int `yaml:"jaeger_compact_thrift_udp_port"`
+	JaegerBinaryThriftUDPPort  int `yaml:"jaeger_binary_thrift_udp_port"`
+}
 
 // Receiver type is used to receive spans that were originally intended to be sent to Jaeger.
 // This receiver is basically a Jaeger collector.
@@ -46,6 +58,7 @@ type jReceiver struct {
 
 	tchannelPort      int
 	collectorHTTPPort int
+	agentPort         int
 
 	tchannel        *tchannel.Channel
 	collectorServer *http.Server
@@ -57,6 +70,14 @@ const (
 	defaultTChannelPort = 14267
 	// By default, can accept spans directly from clients in jaeger.thrift format over binary thrift protocol
 	defaultCollectorHTTPPort = 14268
+
+	// As per https://www.jaegertracing.io/docs/1.7/deployment/#agent
+	// 5775	UDP accept zipkin.thrift over compact thrift protocol
+	// 6831	UDP accept jaeger.thrift over compact thrift protocol
+	// 6832	UDP accept jaeger.thrift over binary thrift protocol
+	defaultZipkinThriftUDPPort        = 5775
+	defaultJaegerCompactThriftUDPPort = 6831
+	defaultJaegerBinaryThriftUDPPort  = 6832
 )
 
 // New creates a TraceReceiver that receives traffic as a collector with both Thrift and HTTP transports.
@@ -75,6 +96,14 @@ func (jr *jReceiver) collectorAddr() string {
 	port := jr.collectorHTTPPort
 	if port <= 0 {
 		port = defaultCollectorHTTPPort
+	}
+	return fmt.Sprintf(":%d", port)
+}
+
+func (jr *jReceiver) agentAddress() string {
+	port := jr.agentPort
+	if port <= 0 {
+		port = defaultAgentPort
 	}
 	return fmt.Sprintf(":%d", port)
 }
@@ -126,6 +155,17 @@ func (jr *jReceiver) StartTraceReception(ctx context.Context, spanSink receiver.
 			_ = jr.collectorServer.Serve(cln)
 		}()
 
+		// Now create the Jaeger agent running over UDP and HTTP
+		jr.agentServer = &http.Server{Addr: jr.agentAddress()}
+
+		procs := []processors.Processor{jr}
+		jr.agent = agentapp.NewAgent(procs, jr.agentServer, nil)
+		if serr := jr.agent.Run(); serr != nil {
+			jr.StopTraceReception()
+			err = fmt.Errorf("Failed to start Jaeger agent %v", serr)
+			return
+		}
+
 		// Otherwise no error was encountered,
 		// finally set the spanSink
 		jr.spanSink = spanSink
@@ -151,6 +191,11 @@ func (jr *jReceiver) StopTraceReception(ctx context.Context) error {
 			jr.tchannel.Close()
 			jr.tchannel = nil
 		}
+		if jr.agent != nil {
+			jr.agent.Stop()
+			jr.agent = nil
+		}
+
 		if len(errs) == 0 {
 			err = nil
 			return
@@ -185,4 +230,25 @@ func (jr *jReceiver) SubmitBatches(ctx thrift.Context, batches []*jaeger.Batch) 
 		})
 	}
 	return jbsr, nil
+}
+
+var _ reporter.Reporter = (*jReceiver)(nil)
+
+// EmitZipkinBatch implements cmd/agent/reporter.Reporter and it forwards
+// Zipkin spans received by the Jaeger agent processor.
+func (jr *jReceiver) EmitZipkinBatch(spans []*zipkincore.Span) error {
+	return nil
+}
+
+// EmitBatch implements cmd/agent/reporter.Reporter and it forwards
+// Jaeger spans received by the Jaeger agent processor.
+func (jr *jReceiver) EmitBatch(batch *jaeger.Batch) error {
+	octrace, err := tracetranslator.JaegerThriftBatchToOCProto(batch)
+	if err == nil {
+		// TODO: (@odeke-em) add this error for Jaeger observability metrics
+		return err
+	}
+
+	_, err = jr.spanSink.ReceiveSpans(context.Background(), octrace.Node, octrace.Spans...)
+	return err
 }
